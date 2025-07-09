@@ -12,7 +12,7 @@ from xml.dom import minidom
 
 # === SETTINGS ===
 # Define base directory and all subfolders used by the program for input, output, reports, logs, and reference files
-BASE_DIR = r"C:/Users/erim/OneDrive - City of North Bay/DriverLicenceReports"
+BASE_DIR = r"\\v-arisfleet\arisdata"
 FOLDERS = {
     "input": os.path.join(BASE_DIR, "input"),
     "output": os.path.join(BASE_DIR, "output"),
@@ -21,9 +21,8 @@ FOLDERS = {
     "assets": os.path.join(BASE_DIR, "assets"),
     "emails": os.path.join(BASE_DIR, "comparison_reports", "Individual emails"),
     "data_loader": os.path.join(BASE_DIR, "DataLoad_21.1.x"),
-    "excel_output": os.path.join(BASE_DIR, "AseetWorks Excel File")  # ✅ Add this line
+    "excel_output": os.path.join(BASE_DIR, "AseetWorks Excel File") 
 }
-
 
 # Configuration: how many days before expiry should trigger a warning, and whether to delete the previous day's file
 EXPIRY_WINDOW_DAYS = 7
