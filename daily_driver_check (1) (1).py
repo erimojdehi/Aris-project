@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import time
+import smtplib
 import shutil
 import socket
 import subprocess
@@ -9,6 +10,8 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from xml.dom import minidom
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 # === SETTINGS ===
 # Define base directory and all subfolders used by the program for input, output, reports, logs, and reference files
@@ -66,6 +69,33 @@ for old_log in log_files[:-3]:  # keep only 3 most recent
 def log(msg):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] {msg}")
+
+EMAIL_RECIPIENTS = [
+    "John.Ouellette@northbay.ca",
+    "Darin.Roy@northbay.ca",
+    "Tracey.Stack@northbay.ca"
+]
+
+# === EMAIL FUNCTION ===
+def send_email_html(to_addresses, subject, html_content):
+    from_address = "no-reply@northbay.ca"  # or use a monitored internal sender if needed
+
+    if isinstance(to_addresses, str):
+        to_addresses = [to_addresses]  # ensure list format
+
+    msg = MIMEMultipart()
+    msg['From'] = from_address
+    msg['To'] = ", ".join(to_addresses)
+    msg['Subject'] = subject
+    msg.attach(MIMEText(html_content, 'html'))
+
+    try:
+        with smtplib.SMTP("smtp.northbay.ca", 25) as server:
+            server.starttls()
+            server.send_message(msg)
+            log(f"📧 Email sent to: {', '.join(to_addresses)}")
+    except Exception as e:
+        log(f"❌ Failed to send email to {', '.join(to_addresses)}: {e}")
 
 # Access check
 def check_directory_write_access(folder_paths):
@@ -657,6 +687,14 @@ with open(report_file, "w", encoding="utf-8") as f:
     # Mark report end time
     f.write(f"<p><b>End:</b> {datetime.now()}</p>")
 
+# === SEND MAIN SUMMARY EMAIL ===
+try:
+    with open(report_file, "r", encoding="utf-8") as f:
+        summary_html = f.read()
+        send_email_html(EMAIL_RECIPIENTS, "DAILY DRIVER LICENCE REPORT", summary_html)
+except Exception as e:
+    log(f"❌ Failed to send main summary email: {e}")
+
 # === GENERATE INDIVIDUAL OPERATOR EMAILS ===
 # Creates a separate HTML file for each operator affected by any change.
 # These files are saved in a designated folder and can be used as individual email bodies.
@@ -749,6 +787,15 @@ for category, driver_ids in changes.items():
                             <tr><th>Old → New</th><td>{change_text}</td></tr>
                         </table>
                     """)
+
+                # === SEND INDIVIDUAL OPERATOR EMAIL ===
+                try:
+                    with open(filename, "r", encoding="utf-8") as f:
+                        html_content = f.read()
+                        subject_line = f"[Driver Alert] {emp['Operator Name']} – {category.replace('_', ' ').upper()}"
+                        send_email_html(EMAIL_RECIPIENTS, subject_line, html_content)
+                except Exception as e:
+                    log(f"❌ Failed to send individual email for {emp['Operator Name']}: {e}")
 
 # === WRITE RUN SUMMARY TO DAILY LOG FILE ===
 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
