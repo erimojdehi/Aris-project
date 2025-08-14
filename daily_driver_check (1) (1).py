@@ -6,6 +6,7 @@ import smtplib
 import shutil
 import socket
 import subprocess
+import configparser
 import pandas as pd
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -13,9 +14,51 @@ from xml.dom import minidom
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+# === CONFIG LOADER
+def _app_dir():
+    # location of the running script or frozen exe
+    return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_PATH = os.path.join(_app_dir(), "config.ini")
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    if not os.path.exists(CONFIG_PATH):
+        # seed defaults from your current script
+        cfg["EMAIL"] = {
+            "from_address": "no-reply@northbay.ca",
+            "recipients": "eri.mojdehi@northbay.ca"
+        }
+        cfg["PATHS"] = {"base_dir": r"C:\Users\erim\Desktop\DriverLicenceReports"}
+        cfg["SERVER"] = {"host": "v-fleetfocustest", "port": "2000"}
+        cfg["UPLOAD"] = {"fadataloader_user": "SYSADMIN-ARIS", "fadataloader_pass": "CNB4Lp5$Q1J5m"}
+        cfg["POLICY"] = {"expiry_window_days": "7"}
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            cfg.write(f)
+    else:
+        cfg.read(CONFIG_PATH, encoding="utf-8")
+    return cfg
+
+cfg = load_config()
+
+# normalize values/types
+import re as _re
+FROM_ADDRESS = cfg.get("EMAIL", "from_address", fallback="no-reply@northbay.ca")
+_raw_rcpts = cfg.get("EMAIL", "recipients", fallback="eri.mojdehi@northbay.ca")
+EMAIL_RECIPIENTS = [r.strip() for r in _re.split(r"[;,]", _raw_rcpts) if r.strip()]
+
+BASE_DIR = cfg.get("PATHS", "base_dir", fallback=r"C:\Users\erim\Desktop\DriverLicenceReports")
+
+SERVER_HOST = cfg.get("SERVER", "host", fallback="v-fleetfocustest")
+SERVER_PORT = cfg.getint("SERVER", "port", fallback=2000)
+
+FA_USER = cfg.get("UPLOAD", "fadataloader_user", fallback="SYSADMIN-ARIS")
+FA_PASS = cfg.get("UPLOAD", "fadataloader_pass", fallback="CNB4Lp5$Q1J5m")
+
+EXPIRY_WINDOW_DAYS = cfg.getint("POLICY", "expiry_window_days", fallback=7)
+
 # === SETTINGS ===
 # Define base directory and all subfolders used by the program for input, output, reports, logs, and reference files
-BASE_DIR = r"\\v-arisfleet\arisdata"
 FOLDERS = {
     "input": os.path.join(BASE_DIR, "input"),
     "output": os.path.join(BASE_DIR, "output"),
@@ -23,17 +66,11 @@ FOLDERS = {
     "logs": os.path.join(BASE_DIR, "logs"),
     "assets": os.path.join(BASE_DIR, "assets"),
     "emails": os.path.join(BASE_DIR, "comparison_reports", "Individual emails"),
-    "data_loader": os.path.join(BASE_DIR, "DataLoad_21.1.x"),
-    "excel_output": os.path.join(BASE_DIR, "AseetWorks Excel File") 
+    "data_loader": os.path.join(BASE_DIR, "DataLoad_21.1.x"), 
 }
 
 # Configuration: how many days before expiry should trigger a warning, and whether to delete the previous day's file
-EXPIRY_WINDOW_DAYS = 7
 DELETE_YESTERDAY_OUTPUT = True
-
-# Server config (can be changed in future if needed)
-SERVER_HOST = "v-fleetfocustest"
-SERVER_PORT = 2000
 
 # Server check function
 def is_server_online(host, port, timeout=3):
@@ -70,15 +107,9 @@ def log(msg):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] {msg}")
 
-EMAIL_RECIPIENTS = [
-    "John.Ouellette@northbay.ca",
-    "Darin.Roy@northbay.ca",
-    "Tracey.Stack@northbay.ca"
-]
-
 # === EMAIL FUNCTION ===
 def send_email_html(to_addresses, subject, html_content):
-    from_address = "no-reply@northbay.ca"  # or use a monitored internal sender if needed
+    from_address = FROM_ADDRESS
 
     if isinstance(to_addresses, str):
         to_addresses = [to_addresses]  # ensure list format
@@ -116,9 +147,17 @@ def load_employee_csv():
     if not os.path.exists(employee_csv):
         log(f"❌ Employee CSV not found: {employee_csv}")
         return pd.DataFrame()
+
+    # New schema: DepartmentID, DepartmentName, OperatorName, OperatorID, LicenceNo
     df = pd.read_csv(employee_csv)
-    if "Driver Licence Number" not in df.columns:
-        raise ValueError("❌ 'Driver Licence Number' column not found in employee CSV.")
+
+    required = {"DepartmentID", "DepartmentName", "OperatorName", "OperatorID", "LicenceNo"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"❌ Employee CSV missing required columns. Have: {list(df.columns)} | Need: {sorted(required)}")
+
+    # Normalize licence numbers (remove dashes/spaces) — stored back in the SAME column
+    df["LicenceNo"] = df["LicenceNo"].astype(str).str.replace("-", "").str.replace(" ", "")
+
     return df
 
 # Utility to remove dashes and spaces from licence numbers for consistent matching
@@ -136,7 +175,8 @@ check_directory_write_access([
     FOLDERS["logs"],
     FOLDERS["reports"],
     FOLDERS["emails"],
-    FOLDERS["assets"]
+    FOLDERS["assets"],
+    FOLDERS["data_loader"],
 ])
 
 # === CLEAN UP OLD HTML REPORTS ===
@@ -267,11 +307,40 @@ def normalize_comments(text):
     items = [i.strip().lower() for i in text.split(';') if i.strip()]
     return sorted(items)
 
+def wipe_folder(folder):
+    """Delete all files and subfolders inside `folder`."""
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        try:
+            if os.path.isfile(path) or os.path.islink(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+        except Exception as e:
+            log(f"⚠️ Unable to delete {path}: {e}")
+
+def cleanup_output_folder(max_age_hours=48):
+    """Delete .xml/.xlsx in output older than `max_age_hours`."""
+    cutoff = datetime.now() - timedelta(hours=max_age_hours)
+    for name in os.listdir(FOLDERS["output"]):
+        path = os.path.join(FOLDERS["output"], name)
+        if not os.path.isfile(path):
+            continue
+        if not (name.lower().endswith(".xml") or name.lower().endswith(".xlsx")):
+            continue
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(path))
+            if mtime < cutoff:
+                os.remove(path)
+                log(f"🧹 Deleted old output file (>48h): {path}")
+        except Exception as e:
+            log(f"⚠️ Could not delete {path}: {e}")
+
 # Dataloader Excel generator
 def generate_assetworks_xml(df_today):
     """
     Generate AssetWorks-compatible Excel 2003 .xml file from df_today.
-    Output path: FOLDERS["excel_output"]/ARIS_upload_YYYY-MM-DD.xml
+    Output path: FOLDERS["data_loader"]/ARIS_upload_YYYY-MM-DD.xml
     """
 
     # Load employee asset list to retrieve Operator IDs
@@ -280,23 +349,38 @@ def generate_assetworks_xml(df_today):
         print(f"❌ Employee asset file not found: {asset_file}")
         return
 
-    df_assets = pd.read_csv(asset_file)
+    df_assets = pd.read_csv(
+        asset_file,
+        dtype={"LicenceNo": str, "OperatorID": str}
+    )
 
     # Normalize licence numbers for matching
     def normalize_licence_number(lic):
-        return lic.replace("-", "").strip()
+        return str(lic).replace("-", "").replace(" ", "")
 
-    df_today["LicenceKey"] = df_today["Driver Licence Number"].apply(normalize_licence_number)
-    df_assets["LicenceKey"] = df_assets["Driver Licence Number"].apply(normalize_licence_number)
+    df_today["LicenceKey"]  = df_today["Driver Licence Number"].apply(normalize_licence_number)
+    df_assets["LicenceKey"] = df_assets["LicenceNo"].apply(normalize_licence_number)
 
     # Merge today's data with asset list on normalized licence number
     df_merged = pd.merge(df_today, df_assets, on="LicenceKey", how="left")
 
+    # Ensure OperatorID is a clean integer-like string (no trailing '.0')
+    df_merged["OperatorID"] = (
+        df_merged["OperatorID"]
+        .astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.strip()
+    )
+
     # Set output path
     today_str = datetime.today().strftime("%Y-%m-%d")
-    output_dir = FOLDERS["excel_output"]
+    output_dir = FOLDERS["data_loader"]
     os.makedirs(output_dir, exist_ok=True)
     file_path = os.path.join(output_dir, f"ARIS_upload_{today_str}.xml")
+
+    _bad = df_merged["OperatorID"].fillna("").astype(str).str.contains(r"\.")
+    if _bad.any():
+        raise ValueError(f"OperatorID still contains decimals for {_bad.sum()} row(s) - Not able to upload.")
 
     # Build Excel 2003-compatible XML
     Workbook = ET.Element("Workbook", {
@@ -323,7 +407,7 @@ def generate_assetworks_xml(df_today):
         Row = ET.SubElement(Table, "Row")
         values = [
             "[u:1]",
-            row.get("Operator ID", "UNKNOWN"),
+            row.get("OperatorID", "UNKNOWN"),
             today_str,
             row["Expiry Date"],
             row["Class"],
@@ -360,7 +444,6 @@ def compare_dfs(df1, df2):
     "class": [], "status": [], "comments": [],
     "expiring_licences": [], "expiring_medicals": [], "errors": []
     }
-
 
     today_ids = set(df1.index)
     for driver_id in today_ids:
@@ -438,18 +521,20 @@ df_employees = load_employee_csv()
 # Generate AssetWorks-compatible upload XML
 generate_assetworks_xml(df_today)
 
-# === DELETE YESTERDAY’S FILES FROM DataLoad_21.1.x ===
-yesterday_str = yesterday.strftime("%Y-%m-%d")
-old_dl_xml = os.path.join(FOLDERS["data_loader"], f"ARIS_upload_{yesterday_str}.xml")
-old_dl_processed = os.path.join(FOLDERS["data_loader"], f"ARIS_upload_{yesterday_str}-processed.txt")
-
-for old_file in [old_dl_xml, old_dl_processed]:
-    if os.path.exists(old_file):
+# === PURGE OLD DataLoad_21.1.x ARTIFACTS (KEEP ONLY TODAY) ===
+today_str = datetime.today().strftime("%Y-%m-%d")
+for name in os.listdir(FOLDERS["data_loader"]):
+    # Only target DataLoader artifacts
+    if not (name.startswith("ARIS_upload_") and (name.endswith(".xml") or name.endswith("-processed.txt"))):
+        continue
+    # Keep today's files, delete everything else
+    if f"ARIS_upload_{today_str}" not in name:
+        path = os.path.join(FOLDERS["data_loader"], name)
         try:
-            os.remove(old_file)
-            log(f"🗑️ Deleted yesterday’s file: {old_file}")
+            os.remove(path)
+            log(f"🗑️ Deleted old DataLoader file: {path}")
         except Exception as e:
-            log(f"⚠️ Could not delete old file {old_file}: {e}")
+            log(f"⚠️ Could not delete {path}: {e}")
 
 # Generate today's filename
 today_str = datetime.today().strftime("%Y-%m-%d")
@@ -457,10 +542,10 @@ xml_filename = f"ARIS_upload_{today_str}.xml"
 
 # Define server and paths
 server_address = f"{SERVER_HOST}:{SERVER_PORT}"
-source_path = os.path.join(FOLDERS["excel_output"], xml_filename)
 target_path = os.path.join(FOLDERS["data_loader"], xml_filename)
 bat_file_path = os.path.join(FOLDERS["data_loader"], "runfile.bat")
 logs_path = os.path.join(FOLDERS["data_loader"], "logs")
+os.makedirs(logs_path, exist_ok=True)
 
 # Check if server is online
 server_online = is_server_online(SERVER_HOST, SERVER_PORT)
@@ -471,18 +556,10 @@ upload_failures = []
 if server_online:
     log(f"✅ Server {server_address} is reachable. Proceeding with upload.")
 
-    # Step 1: Copy XML file
-    try:
-        shutil.copy2(source_path, target_path)
-        log(f"✅ Copied XML to Data Loader folder: {target_path}")
-    except Exception as e:
-        log(f"❌ Failed to copy XML file: {e}")
-        upload_failures.append(f"❌ XML copy failed: {e}")
-
-    # Step 2: Write batch file
+    # Step 1: Write batch file
     try:
         bat_content = f'''@echo off
-start "" /B FADATALOADER.EXE -n "10" -l "{logs_path}" -a "{server_address}" -u "SYSADMIN-ARIS" -p "CNB4Lp5$Q1J5m" -i "{xml_filename}"
+start "" /B FADATALOADER.EXE -n "10" -l "{logs_path}" -a "{server_address}" -u "{FA_USER}" -p "{FA_PASS}" -i "{xml_filename}"
 exit
 '''
         with open(bat_file_path, "w", encoding="utf-8") as f:
@@ -492,7 +569,7 @@ exit
         log(f"❌ Failed to write runfile.bat: {e}")
         upload_failures.append(f"❌ BAT creation failed: {e}")
 
-    # Step 3: Launch Data Loader
+    # Step 2: Launch Data Loader
     try:
         subprocess.Popen(
             ["cmd.exe", "/c", "start", "runfile.bat"],
@@ -503,25 +580,23 @@ exit
         log(f"❌ Failed to launch runfile.bat: {e}")
         upload_failures.append(f"❌ BAT launch failed: {e}")
 
-    if server_online:
+    # Step 3: Check for processed confirmation
+    processed_file = os.path.join(FOLDERS["data_loader"], f"ARIS_upload_{today_str}-processed.txt")
 
-        # Step 4: Check for processed confirmation
-        processed_file = os.path.join(FOLDERS["data_loader"], f"ARIS_upload_{today_str}-processed.txt")
+    # Wait 10 seconds to allow FADataLoader to generate the confirmation file
+    time.sleep(10)
 
-        # Wait 10 seconds to allow FADataLoader to generate the confirmation file
-        time.sleep(10)
-
-        if os.path.exists(processed_file):
-            upload_success = True
-            uploaded_count = total_today
-            log(f"✅ Upload confirmed: {processed_file} found")
-        else:
-            log(f"⚠️ Upload may have failed: {processed_file} not found")
-            upload_failures.append("⚠️ No confirmation file generated")
-
+    if os.path.exists(processed_file):
+        upload_success = True
+        uploaded_count = total_today
+        log(f"✅ Upload confirmed: {processed_file} found")
     else:
-        log(f"❌ Server {server_address} is unreachable. Upload step skipped.")
-        upload_failures.append(f"❌ Server unreachable: {server_address}")
+        log(f"⚠️ Upload may have failed: {processed_file} not found")
+        upload_failures.append("⚠️ No confirmation file generated")
+
+else:
+    log(f"❌ Server {server_address} is unreachable. Upload step skipped.")
+    upload_failures.append(f"❌ Server unreachable: {server_address}")
 
 # === WRITE LOG ===
 # Generate the main summary HTML report with consistent styling, summary statistics, and change tables
@@ -584,11 +659,12 @@ with open(report_file, "w", encoding="utf-8") as f:
     # Start time and summary list of detected changes
     f.write(f"<p><b>Start:</b> {start_time}</p>\n")
 
-    # Add server status info
-    if server_online:
-        f.write(f"<p><b>Server Status:</b> ✅ {SERVER_HOST}:{SERVER_PORT} is online</p>\n")
-    else:
-        f.write(f"<p style='color:darkred;'><b>Server Status:</b> ❌ {SERVER_HOST}:{SERVER_PORT} is UNREACHABLE — upload skipped</p>\n")
+    # Only show server status if it is DOWN
+    if not server_online:
+        f.write(
+            f"<p style='color:darkred;'><b>Server Status:</b> ❌ "
+            f"{SERVER_HOST}:{SERVER_PORT} is UNREACHABLE — upload skipped</p>\n"
+        )
 
     f.write("<ul>")
     f.write(f"<li>Total operators pulled from parser: {total_today}</li>")
@@ -612,7 +688,7 @@ with open(report_file, "w", encoding="utf-8") as f:
         if category == 'errors':
             continue
         for driver_id in driver_ids:
-            match = df_employees[df_employees['Driver Licence Number'].apply(normalize_Licence_number) == driver_id]
+            match = df_employees[df_employees['LicenceNo'].apply(normalize_Licence_number) == driver_id]
             if not match.empty:
                 emp = match.iloc[0]
                 col_name = {
@@ -651,8 +727,8 @@ with open(report_file, "w", encoding="utf-8") as f:
                     # Output formatted table block
                     f.write(f"""
                     <table>
-                        <tr><th>Employee</th><td>{emp['Operator Name']} (ID: {emp['Operator ID']})</td></tr>
-                        <tr><th>Department</th><td>{emp['Department Name']} (ID: {emp['Department ID']})</td></tr>
+                        <tr><th>Employee</th><td>{emp['OperatorName']} (ID: {emp['OperatorID']})</td></tr>
+                        <tr><th>Department</th><td>{emp['DepartmentName']} (ID: {emp['DepartmentID']})</td></tr>
                         <tr><th>Change Type</th><td>{category.replace('_', ' ').upper()}</td></tr>
                         <tr><th>Old → New</th><td>{change_text}</td></tr>
                         <tr><th>Driver Licence Number</th><td>{lic_formatted}</td></tr>
@@ -680,20 +756,29 @@ with open(report_file, "w", encoding="utf-8") as f:
     # Optionally delete yesterday’s XML file if configured
     if os.path.exists(yesterday_xml) and DELETE_YESTERDAY_OUTPUT:
         os.remove(yesterday_xml)
-        f.write("<p>Old (yesterday) datafile deleted: Yes</p>")
-    else:
-        f.write("<p>Old (yesterday) datafile deleted: No</p>")
+
+     # Add explicit AssetWorks upload result at the bottom
+    upload_line = "AssetWorks upload: DONE" if upload_success else "❌ AssetWorks upload: NOT CONFIRMED"
+    if upload_failures:
+        upload_line += " — " + " | ".join(upload_failures)
+    f.write(f"<p><b>{upload_line}</b></p>")
 
     # Mark report end time
     f.write(f"<p><b>End:</b> {datetime.now()}</p>")
 
 # === SEND MAIN SUMMARY EMAIL ===
 try:
-    with open(report_file, "r", encoding="utf-8") as f:
-        summary_html = f.read()
-        send_email_html(EMAIL_RECIPIENTS, "DAILY DRIVER LICENCE REPORT", summary_html)
+    with open(report_file, "r", encoding="utf-8") as rf:
+        html_body = rf.read()
+
+    # subject line — add server-down flag when offline
+    subject = f"Driver Licence Change Report – {today}"
+    if not server_online:
+        subject += " [SERVER DOWN]"
+
+    send_email_html(EMAIL_RECIPIENTS, subject, html_body)
 except Exception as e:
-    log(f"❌ Failed to send main summary email: {e}")
+    log(f"❌ Failed to prepare/send email: {e}")
 
 # === GENERATE INDIVIDUAL OPERATOR EMAILS ===
 # Creates a separate HTML file for each operator affected by any change.
@@ -703,7 +788,7 @@ for category, driver_ids in changes.items():
         continue
     for driver_id in driver_ids:
         # Match operator info from master employee CSV
-        match = df_employees[df_employees['Driver Licence Number'].apply(normalize_Licence_number) == driver_id]
+        match = df_employees[df_employees['LicenceNo'].apply(normalize_Licence_number) == driver_id]
         if not match.empty:
             emp = match.iloc[0]
 
@@ -722,7 +807,7 @@ for category, driver_ids in changes.items():
                 new_val = df_today_indexed.loc[driver_id][col_name]
                 
                 # Build safe filename using operator name and change type
-                operator_name_safe = re.sub(r'[\\/*?:"<>|]', "_", emp['Operator Name']).replace(",", "").replace(" ", "_")
+                operator_name_safe = re.sub(r'[\\/*?:"<>|]', "_", emp['OperatorName']).replace(",", "").replace(" ", "_")
                 filename = os.path.join(FOLDERS["emails"], f"{operator_name_safe}_{category}.html")
 
                 with open(filename, "w", encoding="utf-8") as indf:
@@ -781,8 +866,8 @@ for category, driver_ids in changes.items():
                         <h3>Driver Licence Change Notification</h3>
                         <p><b>Report Generated:</b> {today}</p>
                         <table>
-                            <tr><th>Employee</th><td>{emp['Operator Name']} (ID: {emp['Operator ID']})</td></tr>
-                            <tr><th>Department</th><td>{emp['Department Name']} (ID: {emp['Department ID']})</td></tr>
+                            <tr><th>Employee</th><td>{emp['OperatorName']} (ID: {emp['OperatorID']})</td></tr>
+                            <tr><th>Department</th><td>{emp['DepartmentName']} (ID: {emp['DepartmentID']})</td></tr>
                             <tr><th>Change Type</th><td>{category.replace('_', ' ').upper()}</td></tr>
                             <tr><th>Old → New</th><td>{change_text}</td></tr>
                         </table>
@@ -792,10 +877,10 @@ for category, driver_ids in changes.items():
                 try:
                     with open(filename, "r", encoding="utf-8") as f:
                         html_content = f.read()
-                        subject_line = f"[Driver Alert] {emp['Operator Name']} – {category.replace('_', ' ').upper()}"
+                        subject_line = f"[Driver Alert] {emp['OperatorName']} – {category.replace('_', ' ').upper()}"
                         send_email_html(EMAIL_RECIPIENTS, subject_line, html_content)
                 except Exception as e:
-                    log(f"❌ Failed to send individual email for {emp['Operator Name']}: {e}")
+                    log(f"❌ Failed to send individual email for {emp['OperatorName']}: {e}")
 
 # === WRITE RUN SUMMARY TO DAILY LOG FILE ===
 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -843,7 +928,20 @@ else:
 log_summary.append("=" * 60)
 
 # Write to log file (append mode)
-with open(log_file, "w", encoding="utf-8") as f:
+with open(log_file, "a", encoding="utf-8") as f:
     f.write("\n".join(log_summary) + "\n")
 
 print(f"✅ Log updated: {log_file}")
+
+# Empty input folder for next drop
+try:
+    wipe_folder(FOLDERS["input"])
+    log("Emptied input folder.")
+except Exception as e:
+    log(f"⚠️ Failed to empty input folder: {e}")
+
+# Remove output Excel-XML files older than 48h
+try:
+    cleanup_output_folder(max_age_hours=48)
+except Exception as e:
+    log(f"⚠️ Output cleanup error: {e}")
