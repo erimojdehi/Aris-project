@@ -8,6 +8,7 @@ import socket
 import subprocess
 import configparser
 import pandas as pd
+from html import escape
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from xml.dom import minidom
@@ -552,47 +553,99 @@ server_online = is_server_online(SERVER_HOST, SERVER_PORT)
 upload_success = False
 uploaded_count = 0
 upload_failures = []
+fa_exit_code = None
 
 if server_online:
     log(f"✅ Server {server_address} is reachable. Proceeding with upload.")
 
-    # Step 1: Write batch file
+    # Step 1: Write batch file (UNC-safe via pushd)
     try:
-        bat_content = f'''@echo off
-start "" /B FADATALOADER.EXE -n "10" -l "{logs_path}" -a "{server_address}" -u "{FA_USER}" -p "{FA_PASS}" -i "{xml_filename}"
-exit
-'''
-        with open(bat_file_path, "w", encoding="utf-8") as f:
+        data_loader_dir = FOLDERS["data_loader"]  
+        bat_content = f"""@echo off
+    setlocal
+    pushd "{data_loader_dir}"
+    REM Now we're in a temp drive letter that maps the UNC; relative paths work.
+
+    START "" /WAIT FADATALOADER.EXE -n "10" -l "logs" -a "{server_address}" -u "{FA_USER}" -p "{FA_PASS}" -i "{xml_filename}"
+
+    popd
+    endlocal
+    """
+        with open(bat_file_path, "w", encoding="utf-8", newline="\r\n") as f:
             f.write(bat_content)
+
         log(f"✅ Updated runfile.bat for: {xml_filename}")
     except Exception as e:
         log(f"❌ Failed to write runfile.bat: {e}")
         upload_failures.append(f"❌ BAT creation failed: {e}")
 
-    # Step 2: Launch Data Loader
+    # Step 2: Launch Data Loader (do NOT set cwd to a UNC)
     try:
-        subprocess.Popen(
-            ["cmd.exe", "/c", "start", "runfile.bat"],
-            cwd=os.path.dirname(bat_file_path)
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        result = subprocess.run(
+            ["cmd.exe", "/c", bat_file_path],
+            creationflags=flags,
+            timeout=300
         )
-        log("✅ runfile.bat launched in new CMD window (check visually for progress)")
+        fa_exit_code = result.returncode
+        log(f"✅ runfile.bat executed (FA exit code: {fa_exit_code})")
+        if fa_exit_code != 0:
+            upload_failures.append(f"⚠️ DataLoader exit code: {fa_exit_code}")
     except Exception as e:
-        log(f"❌ Failed to launch runfile.bat: {e}")
+        log(f"❌ Failed to execute runfile.bat: {e}")
         upload_failures.append(f"❌ BAT launch failed: {e}")
 
-    # Step 3: Check for processed confirmation
+    # Step 3: Check for processed confirmation (poll up to ~90s)
     processed_file = os.path.join(FOLDERS["data_loader"], f"ARIS_upload_{today_str}-processed.txt")
 
-    # Wait 10 seconds to allow FADataLoader to generate the confirmation file
-    time.sleep(10)
+    found_processed = False
+    for _ in range(30):  # ~90 seconds max
+        if os.path.exists(processed_file):
+            found_processed = True
+            break
+        time.sleep(3)
 
-    if os.path.exists(processed_file):
-        upload_success = True
+    upload_success = (fa_exit_code == 0 and found_processed)
+
+    if upload_success:
         uploaded_count = total_today
-        log(f"✅ Upload confirmed: {processed_file} found")
+        log(f"✅ Upload confirmed: {processed_file} found and FA exit code 0")
     else:
-        log(f"⚠️ Upload may have failed: {processed_file} not found")
-        upload_failures.append("⚠️ No confirmation file generated")
+        if not found_processed:
+            log(f"⚠️ Upload may have failed: {processed_file} not found")
+            upload_failures.append("⚠️ No confirmation file generated")
+        if fa_exit_code is None:
+            upload_failures.append("⚠️ FA did not run (no exit code)")
+        elif fa_exit_code != 0:
+            upload_failures.append(f"⚠️ FA exit code: {fa_exit_code}")
+
+    # Also require a fresh, non-empty FA log (written in the last 10 minutes)
+    fa_logs_root = os.path.join(FOLDERS["data_loader"], "logs")
+    latest_fa_log, latest_mtime = None, 0.0
+    if os.path.exists(fa_logs_root):
+        for root, _, files in os.walk(fa_logs_root):
+            for name in files:
+                if name.lower().endswith(".txt"):
+                    p = os.path.join(root, name)
+                    try:
+                        m = os.path.getmtime(p)
+                        if m > latest_mtime:
+                            latest_mtime, latest_fa_log = m, p
+                    except Exception:
+                        pass
+
+    fa_log_ok = False
+    if latest_fa_log and os.path.exists(latest_fa_log):
+        try:
+            size_ok = os.path.getsize(latest_fa_log) > 0
+            recent_ok = (time.time() - latest_mtime) <= 600  # 10 minutes
+            fa_log_ok = size_ok and recent_ok
+        except Exception:
+            fa_log_ok = False
+
+    if upload_success and not fa_log_ok:
+        upload_success = False
+        upload_failures.append("⚠️ FA log missing, empty, or stale")
 
 else:
     log(f"❌ Server {server_address} is unreachable. Upload step skipped.")
@@ -653,6 +706,7 @@ with open(report_file, "w", encoding="utf-8") as f:
         ul {
             margin-bottom: 30px;
         }
+
     </style>
     """)
 
@@ -675,7 +729,62 @@ with open(report_file, "w", encoding="utf-8") as f:
     f.write(f"<li>Total operators within {EXPIRY_WINDOW_DAYS} days of valid expiry: {len(changes['expiring_licences'])}</li>")
     f.write(f"<li>Total operators within {EXPIRY_WINDOW_DAYS} days of medical expiry: {len(changes['expiring_medicals'])}</li>")
     f.write("</ul>")
+
+    # === Unlicenced Operators (details) ===
+    if total_unlicenced > 0:
+        f.write("<h3>Unlicenced Operators</h3>")
+
+        # Pull all rows from today's data where status != LICENCED
+        unlic_df = df_today.copy()
+        # df_today at this point has licence numbers normalized; pull raw formatted number from original cols
+        # Re-read formatted licence numbers for display
+        unlic_df["LicenceRaw"] = unlic_df.index if "Driver Licence Number" not in unlic_df.columns else unlic_df["Driver Licence Number"]
+        if "Driver Licence Number" in unlic_df.columns:
+            pass  # already present
+        else:
+            # If we lost the column during normalization, recover from index
+            unlic_df["Driver Licence Number"] = unlic_df.index
+
+        unlic_df = unlic_df[unlic_df["Licence Status"].str.upper() != "LICENCED"]
+
+        # Build a lookup on the employee master by normalised licence
+        emp_lookup = df_employees.copy()
+        emp_lookup["LicenceKey"] = emp_lookup["LicenceNo"].apply(normalize_Licence_number)
+
+        for _, row in unlic_df.iterrows():
+            lic_norm = normalize_Licence_number(row["Driver Licence Number"])
+            disp_lic = f"{lic_norm[:5]}-{lic_norm[5:10]}-{lic_norm[10:]}" if len(lic_norm) == 15 else row["Driver Licence Number"]
+
+            hit = emp_lookup[emp_lookup["LicenceKey"] == lic_norm]
+            if not hit.empty:
+                emp = hit.iloc[0]
+                name = emp["OperatorName"]
+                op_id = emp["OperatorID"]
+                dept_id = emp["DepartmentID"]
+                dept_name = emp.get("DepartmentName", "UNKNOWN")
+            else:
+                # Fallback if not in employee master
+                name = row.get("Client Name", "UNKNOWN")
+                op_id = "UNKNOWN"
+                dept_id = "UNKNOWN"
+                dept_name = "UNKNOWN"
+
+            comments = (row.get("Comments") or "").strip() or "NONE"
+            status = (row.get("Licence Status") or "").strip() or "UNKNOWN"
+
+            # Render like "Operators With Changes": a 2-column stacked table
+            f.write(f"""
+            <table>
+                <tr><th>Employee</th><td>{escape(str(name))} (ID: {escape(str(op_id))})</td></tr>
+                <tr><th>Department</th><td>{escape(str(dept_name))} (ID: {escape(str(dept_id))})</td></tr>
+                <tr><th>Licence Status</th><td>{escape(status)}</td></tr>
+                <tr><th>Driver Licence Number</th><td>{escape(disp_lic)}</td></tr>
+                <tr><th>Comments</th><td>{escape(comments)}</td></tr>
+            </table>
+            """)
+
     f.write("<h3>Operators With Changes</h3>")
+    changes_written = 0
 
     # Normalize and re-index for fast lookups
     df_today["Driver Licence Number"] = df_today["Driver Licence Number"].apply(normalize_Licence_number)
@@ -735,6 +844,10 @@ with open(report_file, "w", encoding="utf-8") as f:
                         <tr><th>Comments</th><td>{comments}</td></tr>
                     </table>
                     """)
+                    changes_written += 1
+
+    if changes_written == 0:
+        f.write("<p>NONE</p>")
 
     # Handle and display errors detected during comparison
     if changes["errors"]:
@@ -761,7 +874,60 @@ with open(report_file, "w", encoding="utf-8") as f:
     upload_line = "AssetWorks upload: DONE" if upload_success else "❌ AssetWorks upload: NOT CONFIRMED"
     if upload_failures:
         upload_line += " — " + " | ".join(upload_failures)
-    f.write(f"<p><b>{upload_line}</b></p>")
+    f.write(f"<p style='margin-top:30px; margin-bottom:0;'><b>{upload_line}</b></p>")
+
+    # === Append FA DataLoader "Summary" log into the email ===
+    try:
+        # Prefer today's Summary in ...\logs\2022 (FA import code "2022")
+        dl_logs_2022 = os.path.join(FOLDERS["data_loader"], "logs", "2022")
+        fa_log_for_email = None
+        pattern_prefix = f"ARIS_upload_{today_str}-2022-"
+        if os.path.isdir(dl_logs_2022):
+            candidates = [
+                name for name in os.listdir(dl_logs_2022)
+                if name.endswith("-Summary.txt") and name.startswith(pattern_prefix)
+            ]
+            if candidates:
+                candidates.sort(key=lambda n: os.path.getmtime(os.path.join(dl_logs_2022, n)), reverse=True)
+                fa_log_for_email = os.path.join(dl_logs_2022, candidates[0])
+
+        # Fallback: latest .txt anywhere under ...\logs (any year/subfolder)
+        if not fa_log_for_email:
+            fa_logs_root = os.path.join(FOLDERS["data_loader"], "logs")
+            newest_path, newest_m = None, 0.0
+            if os.path.exists(fa_logs_root):
+                for root, _, files in os.walk(fa_logs_root):
+                    for name in files:
+                        if not name.lower().endswith(".txt"):
+                            continue
+                        p = os.path.join(root, name)
+                        try:
+                            m = os.path.getmtime(p)
+                            if m > newest_m:
+                                newest_m, newest_path = m, p
+                        except Exception:
+                            pass
+            fa_log_for_email = newest_path
+
+        f.write("<p style='margin:0;'><b>AssetWorks Loader Summary Log</b></p>")
+        if fa_log_for_email and os.path.exists(fa_log_for_email):
+            with open(fa_log_for_email, "r", encoding="utf-8", errors="ignore") as lfp:
+                content = lfp.read()
+            max_lines = 400
+            lines = content.splitlines()
+            if len(lines) > max_lines:
+                content = "\n".join(["(…truncated… last 400 lines)"] + lines[-max_lines:])
+
+            # Escape for HTML and show nicely
+            f.write(
+                "<div style='border:1px solid #ccc; background:#fafafa; padding:10px; margin-top:6px;'>"
+                f"<pre style='white-space:pre-wrap; margin:0; font-size:14px;'>{escape(content)}</pre>"
+                "</div>"
+            )
+        else:
+            f.write("<p><i>No FA DataLoader log was found for today.</i></p>")
+    except Exception as e:
+        f.write(f"<p style='color:darkred;'><b>⚠️ Failed to include FA DataLoader log:</b> {escape(str(e))}</p>")
 
     # Mark report end time
     f.write(f"<p><b>End:</b> {datetime.now()}</p>")
@@ -885,14 +1051,20 @@ for category, driver_ids in changes.items():
 # === WRITE RUN SUMMARY TO DAILY LOG FILE ===
 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-# Locate latest FADataLoader .txt log file
-log_2022_dir = os.path.join(FOLDERS["data_loader"], "logs", "2022")
-latest_fa_log = None
-if os.path.exists(log_2022_dir):
-    txt_files = [f for f in os.listdir(log_2022_dir) if f.endswith(".txt")]
-    if txt_files:
-        txt_files.sort(key=lambda x: os.path.getmtime(os.path.join(log_2022_dir, x)), reverse=True)
-        latest_fa_log = os.path.join(log_2022_dir, txt_files[0])
+# Locate latest FADataLoader .txt log file (any year folder under logs)
+fa_logs_root = os.path.join(FOLDERS["data_loader"], "logs")
+latest_fa_log, latest_mtime = None, 0.0
+if os.path.exists(fa_logs_root):
+    for root, _, files in os.walk(fa_logs_root):
+        for name in files:
+            if name.lower().endswith(".txt"):
+                p = os.path.join(root, name)
+                try:
+                    m = os.path.getmtime(p)
+                    if m > latest_mtime:
+                        latest_mtime, latest_fa_log = m, p
+                except Exception:
+                    pass
 
 # Prepare log content
 log_summary = [
