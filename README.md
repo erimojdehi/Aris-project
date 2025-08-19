@@ -49,14 +49,23 @@ What remains here are the **calculation algorithms, workflow structures, compari
 ## Folder Structure
 /DriverLicenceReports
 │
+
 ├── AseetWorks Excel File # Stores generated XML files
+
 ├── comparison_reports # Main & individual HTML reports
+
 │ └── emails # One-row operator email reports
+
 ├── DataLoad_21.1.x # FA Data Loader integration
+
 │ └── logs # FA Data Loader raw log outputs
+
 ├── input # Raw ARIS input files
+
 ├── input backups # Archived daily ARIS input copies
+
 ├── logs # Unified application log (appends daily)
+
 └── errors # Error snapshots
 
 
