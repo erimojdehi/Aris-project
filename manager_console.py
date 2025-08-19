@@ -18,10 +18,6 @@ def app_dir():
     return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_PATH = os.path.join(app_dir(), "config.ini")
-MAIN_EXE_CANDIDATES = [
-    os.path.join(app_dir(), "daily_driver_check.exe"),
-    os.path.join(app_dir(), "daily_driver_check.py"),
-]
 
 FOLDERS = lambda base: {
     "input": os.path.join(base, "input"),
@@ -41,7 +37,7 @@ def load_config():
     cfg = configparser.ConfigParser()
     if not os.path.exists(CONFIG_PATH):
         cfg["EMAIL"] = {"from_address": "no-reply@northbay.ca", "recipients": ""}
-        cfg["PATHS"] = {"base_dir": r"C:\\DriverLicenceReports"}
+        cfg["PATHS"] = {"base_dir": r"\\v-arisfleet\arisdata\DriverLicenceReports"}
         cfg["SERVER"] = {"host": "v-fleetfocustest", "port": "2000"}
         cfg["UPLOAD"] = {"fadataloader_user": "SYSADMIN-ARIS", "fadataloader_pass": ""}
         cfg["POLICY"] = {"expiry_window_days": "7"}
@@ -65,11 +61,9 @@ def save_config(values):
     }
     cfg["PATHS"] = {"base_dir": values["base_dir"].strip()}
     cfg["SERVER"] = {"host": values["host"].strip(), "port": str(values["port"]).strip()}
-    cfg["UPLOAD"] = {
-        "fadataloader_user": values["fa_user"].strip(),
-        "fadataloader_pass": values["fa_pass"],
-    }
+    cfg["UPLOAD"] = {"fadataloader_user": values["fa_user"].strip(), "fadataloader_pass": values["fa_pass"]}
     cfg["POLICY"] = {"expiry_window_days": str(values["expiry_window_days"]).strip()}
+
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         cfg.write(f)
 
@@ -169,13 +163,13 @@ class ManagerConsole(ttk.Frame):
         super().__init__(master)
         self.pack(fill="both", expand=True)
         master.title(APP_TITLE)
-        master.minsize(760, 560)
+        master.minsize(760, 520)
 
         self.cfg = load_config()
         self._init_styles(master)
         self.vars = self._build_vars()
 
-        # Header row with Dark Mode toggle
+        # Header
         header = ttk.Frame(self)
         header.pack(fill="x", padx=10, pady=(10,0))
         ttk.Label(header, text=APP_TITLE, style="Header.TLabel").pack(side="left")
@@ -188,7 +182,7 @@ class ManagerConsole(ttk.Frame):
         nb.add(self._server_tab(nb), text="Server")
         nb.add(self._upload_tab(nb), text="Data Loader Credentials")
         nb.add(self._policy_tab(nb), text="Expiry Alert Window")
-        # NOTE: Tools tab removed per spec
+        # NOTE: Scheduling tab removed per new requirements
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=8, pady=(0,10))
@@ -199,17 +193,14 @@ class ManagerConsole(ttk.Frame):
     # -----------------------
     def _init_styles(self, root):
         style = ttk.Style(root)
-        # use a consistent base theme
         base_theme = "clam" if "clam" in style.theme_names() else style.theme_use()
         style.theme_use(base_theme)
-        # base styles
         style.configure("TFrame", padding=6)
         style.configure("TButton", padding=(10,6))
         style.configure("TLabel", padding=2)
         style.configure("Header.TLabel", font=("Segoe UI", 13, "bold"))
         style.configure("Accent.TButton", background=ACCENT, foreground="black")
         style.map("Accent.TButton", background=[("active", ACCENT)], foreground=[("disabled", "#777")])
-        # entry validation styles
         style.configure("Invalid.TEntry", fieldbackground="#ffecec")
         style.configure("Valid.TEntry", fieldbackground="white")
 
@@ -217,7 +208,7 @@ class ManagerConsole(ttk.Frame):
         v = {
             "from_address": tk.StringVar(value=self.cfg.get("EMAIL", "from_address", fallback="no-reply@northbay.ca")),
             "recipients": tk.StringVar(value=self.cfg.get("EMAIL", "recipients", fallback="")),
-            "base_dir": tk.StringVar(value=self.cfg.get("PATHS", "base_dir", fallback=r"C:\\DriverLicenceReports")),
+            "base_dir": tk.StringVar(value=self.cfg.get("PATHS", "base_dir", fallback=r"\\\\v-arisfleet\\arisdata\\DriverLicenceReports")),
             "host": tk.StringVar(value=self.cfg.get("SERVER", "host", fallback="v-fleetfocustest")),
             "port": tk.StringVar(value=self.cfg.get("SERVER", "port", fallback="2000")),
             "fa_user": tk.StringVar(value=self.cfg.get("UPLOAD", "fadataloader_user", fallback="SYSADMIN-ARIS")),
@@ -229,11 +220,11 @@ class ManagerConsole(ttk.Frame):
     # -----------------------
     def _email_tab(self, parent):
         f = ttk.Frame(parent)
+        self._email_tab_frame = f
         grid2(f)
         ttk.Label(f, text="From address:").grid(row=0, column=0, sticky="w")
         ttk.Entry(f, textvariable=self.vars["from_address"], width=40).grid(row=0, column=1, sticky="we")
 
-        # dynamic recipients list
         emails = [e.strip() for e in re.split(r"[;,]", self.vars["recipients"].get()) if e.strip()]
         self.email_list = EmailList(f, emails)
         self.email_list.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8,0))
@@ -242,7 +233,6 @@ class ManagerConsole(ttk.Frame):
 
     def _paths_tab(self, parent):
         f = ttk.Frame(parent)
-        # layout: left column has stacked Open buttons; right side has base_dir + browse
         left = ttk.Frame(f)
         right = ttk.Frame(f)
         left.pack(side="left", anchor="n", padx=(0,10), pady=(0,0))
@@ -320,7 +310,7 @@ class ManagerConsole(ttk.Frame):
         emails = self.email_list.get_emails()
         bad = [e for e in emails if not EMAIL_RE.match(e)]
         if bad:
-            messagebox.showerror(APP_TITLE, f"Invalid email(s):\n- " + "\n- ".join(bad))
+            messagebox.showerror(APP_TITLE, "Invalid email(s):\n- " + "\n- ".join(bad))
             return
 
         values = {k: v.get() for k, v in self.vars.items()}
@@ -328,7 +318,7 @@ class ManagerConsole(ttk.Frame):
 
         try:
             save_config(values)
-            messagebox.showinfo(APP_TITLE, "Saved to config.ini")
+            messagebox.showinfo(APP_TITLE, "Saved to config.ini.")
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Failed to save config: {e}")
 
@@ -339,9 +329,11 @@ class ManagerConsole(ttk.Frame):
             self.vars[key].set(self.cfg.get(sec, opt, fallback=self.vars[key].get()))
         # refresh email list
         emails = [e.strip() for e in re.split(r"[;,]", self.cfg.get("EMAIL", "recipients", fallback="")) if e.strip()]
-        for r, _, _ in getattr(self, 'email_list', EmailList(self)).rows:
-            r.destroy()
-        self.email_list = EmailList(self._email_tab_frame, emails) if hasattr(self, '_email_tab_frame') else EmailList(self, emails)
+        if hasattr(self, "email_list"):
+            self.email_list.destroy()
+        self.email_list = EmailList(self._email_tab_frame, emails)
+        self.email_list.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8,0))
+
         messagebox.showinfo(APP_TITLE, "Config reloaded from disk.")
 
 
