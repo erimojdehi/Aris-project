@@ -68,6 +68,7 @@ FOLDERS = {
     "assets": os.path.join(BASE_DIR, "assets"),
     "emails": os.path.join(BASE_DIR, "comparison_reports", "Individual emails"),
     "data_loader": os.path.join(BASE_DIR, "DataLoad_21.1.x"), 
+    "input_backups": os.path.join(BASE_DIR, "input_backups"),
 }
 
 # Configuration: how many days before expiry should trigger a warning, and whether to delete the previous day's file
@@ -101,7 +102,7 @@ for old_log in log_files[:-3]:  # keep only 3 most recent
     try:
         os.remove(os.path.join(FOLDERS["logs"], old_log))
     except Exception as e:
-        print(f"⚠️ Failed to delete old log: {old_log} – {e}")
+        print(f" Failed to delete old log: {old_log} – {e}")
 
 # Custom logging function to timestamp messages and store them in memory
 def log(msg):
@@ -127,7 +128,7 @@ def send_email_html(to_addresses, subject, html_content):
             server.send_message(msg)
             log(f"📧 Email sent to: {', '.join(to_addresses)}")
     except Exception as e:
-        log(f"❌ Failed to send email to {', '.join(to_addresses)}: {e}")
+        log(f" Failed to send email to {', '.join(to_addresses)}: {e}")
 
 # Access check
 def check_directory_write_access(folder_paths):
@@ -138,15 +139,15 @@ def check_directory_write_access(folder_paths):
                 f.write("test")
             os.remove(test_file)
         except Exception as e:
-            log(f"❌ ERROR: Cannot write to folder: {folder}")
+            log(f" ERROR: Cannot write to folder: {folder}")
             log(f"   Reason: {e}")
-            print(f"❌ Program aborted due to folder access error.")
+            print(f" Program aborted due to folder access error.")
             sys.exit(1)
 
 # Load the employee master CSV and validate its format
 def load_employee_csv():
     if not os.path.exists(employee_csv):
-        log(f"❌ Employee CSV not found: {employee_csv}")
+        log(f" Employee CSV not found: {employee_csv}")
         return pd.DataFrame()
 
     # New schema: DepartmentID, DepartmentName, OperatorName, OperatorID, LicenceNo
@@ -154,7 +155,7 @@ def load_employee_csv():
 
     required = {"DepartmentID", "DepartmentName", "OperatorName", "OperatorID", "LicenceNo"}
     if not required.issubset(df.columns):
-        raise ValueError(f"❌ Employee CSV missing required columns. Have: {list(df.columns)} | Need: {sorted(required)}")
+        raise ValueError(f" Employee CSV missing required columns. Have: {list(df.columns)} | Need: {sorted(required)}")
 
     # Normalize licence numbers (remove dashes/spaces) — stored back in the SAME column
     df["LicenceNo"] = df["LicenceNo"].astype(str).str.replace("-", "").str.replace(" ", "")
@@ -178,6 +179,7 @@ check_directory_write_access([
     FOLDERS["emails"],
     FOLDERS["assets"],
     FOLDERS["data_loader"],
+    FOLDERS["input_backups"],
 ])
 
 # === CLEAN UP OLD HTML REPORTS ===
@@ -187,7 +189,7 @@ for folder in [FOLDERS["reports"], FOLDERS["emails"]]:
             try:
                 os.remove(os.path.join(folder, f))
             except Exception as e:
-                print(f"⚠️ Failed to delete old HTML report: {f} – {e}")
+                print(f" Failed to delete old HTML report: {f} – {e}")
 
 # === ARIS TEXT PARSER ===
 # Parse the fixed-width ARIS .txt input file into structured driver data and export to Excel-compatible XML
@@ -318,7 +320,7 @@ def wipe_folder(folder):
             elif os.path.isdir(path):
                 shutil.rmtree(path)
         except Exception as e:
-            log(f"⚠️ Unable to delete {path}: {e}")
+            log(f" Unable to delete {path}: {e}")
 
 def cleanup_output_folder(max_age_hours=48):
     """Delete .xml/.xlsx in output older than `max_age_hours`."""
@@ -335,7 +337,7 @@ def cleanup_output_folder(max_age_hours=48):
                 os.remove(path)
                 log(f"🧹 Deleted old output file (>48h): {path}")
         except Exception as e:
-            log(f"⚠️ Could not delete {path}: {e}")
+            log(f" Could not delete {path}: {e}")
 
 # Dataloader Excel generator
 def generate_assetworks_xml(df_today):
@@ -347,7 +349,7 @@ def generate_assetworks_xml(df_today):
     # Load employee asset list to retrieve Operator IDs
     asset_file = os.path.join(FOLDERS["assets"], "Active Operator List.csv")
     if not os.path.exists(asset_file):
-        print(f"❌ Employee asset file not found: {asset_file}")
+        print(f" Employee asset file not found: {asset_file}")
         return
 
     df_assets = pd.read_csv(
@@ -428,7 +430,7 @@ def generate_assetworks_xml(df_today):
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(pretty_xml_str)
 
-    print(f"✅ AssetWorks .xml upload file generated: {file_path}")
+    print(f" AssetWorks .xml upload file generated: {file_path}")
     
 # Error Detector
 # Compares today's and yesterday's driver data to detect changes or issues in licence, medical, and status fields
@@ -491,7 +493,7 @@ log(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # Check for today's input file and exit if not found
 if not os.path.exists(input_file):
-    log(f"❌ Input file not found: {input_file}")
+    log(f" Input file not found: {input_file}")
     sys.exit(1)
 
 # Parse ARIS .txt input into XML and DataFrame
@@ -499,7 +501,7 @@ df_today = parse_aris_txt_to_xml(input_file, today_xml)
 
 # Load yesterday’s parsed file if it exists, else use an empty frame
 if not os.path.exists(yesterday_xml):
-    log(f"⚠️ Yesterday’s file not found: {yesterday_xml}")
+    log(f" Yesterday’s file not found: {yesterday_xml}")
     df_yesterday = pd.DataFrame(columns=df_today.columns)
 else:
     df_yesterday = extract_df_from_xml(yesterday_xml)
@@ -535,7 +537,7 @@ for name in os.listdir(FOLDERS["data_loader"]):
             os.remove(path)
             log(f"🗑️ Deleted old DataLoader file: {path}")
         except Exception as e:
-            log(f"⚠️ Could not delete {path}: {e}")
+            log(f" Could not delete {path}: {e}")
 
 # Generate today's filename
 today_str = datetime.today().strftime("%Y-%m-%d")
@@ -556,7 +558,7 @@ upload_failures = []
 fa_exit_code = None
 
 if server_online:
-    log(f"✅ Server {server_address} is reachable. Proceeding with upload.")
+    log(f" Server {server_address} is reachable. Proceeding with upload.")
 
     # Step 1: Write batch file (UNC-safe via pushd)
     try:
@@ -574,10 +576,10 @@ if server_online:
         with open(bat_file_path, "w", encoding="utf-8", newline="\r\n") as f:
             f.write(bat_content)
 
-        log(f"✅ Updated runfile.bat for: {xml_filename}")
+        log(f" Updated runfile.bat for: {xml_filename}")
     except Exception as e:
-        log(f"❌ Failed to write runfile.bat: {e}")
-        upload_failures.append(f"❌ BAT creation failed: {e}")
+        log(f" Failed to write runfile.bat: {e}")
+        upload_failures.append(f" BAT creation failed: {e}")
 
     # Step 2: Launch Data Loader (do NOT set cwd to a UNC)
     try:
@@ -588,12 +590,12 @@ if server_online:
             timeout=300
         )
         fa_exit_code = result.returncode
-        log(f"✅ runfile.bat executed (FA exit code: {fa_exit_code})")
+        log(f" runfile.bat executed (FA exit code: {fa_exit_code})")
         if fa_exit_code != 0:
-            upload_failures.append(f"⚠️ DataLoader exit code: {fa_exit_code}")
+            upload_failures.append(f" DataLoader exit code: {fa_exit_code}")
     except Exception as e:
-        log(f"❌ Failed to execute runfile.bat: {e}")
-        upload_failures.append(f"❌ BAT launch failed: {e}")
+        log(f" Failed to execute runfile.bat: {e}")
+        upload_failures.append(f" BAT launch failed: {e}")
 
     # Step 3: Check for processed confirmation (poll up to ~90s)
     processed_file = os.path.join(FOLDERS["data_loader"], f"ARIS_upload_{today_str}-processed.txt")
@@ -609,15 +611,15 @@ if server_online:
 
     if upload_success:
         uploaded_count = total_today
-        log(f"✅ Upload confirmed: {processed_file} found and FA exit code 0")
+        log(f" Upload confirmed: {processed_file} found and FA exit code 0")
     else:
         if not found_processed:
-            log(f"⚠️ Upload may have failed: {processed_file} not found")
-            upload_failures.append("⚠️ No confirmation file generated")
+            log(f" Upload may have failed: {processed_file} not found")
+            upload_failures.append(" No confirmation file generated")
         if fa_exit_code is None:
-            upload_failures.append("⚠️ FA did not run (no exit code)")
+            upload_failures.append(" FA did not run (no exit code)")
         elif fa_exit_code != 0:
-            upload_failures.append(f"⚠️ FA exit code: {fa_exit_code}")
+            upload_failures.append(f" FA exit code: {fa_exit_code}")
 
     # Also require a fresh, non-empty FA log (written in the last 10 minutes)
     fa_logs_root = os.path.join(FOLDERS["data_loader"], "logs")
@@ -645,11 +647,11 @@ if server_online:
 
     if upload_success and not fa_log_ok:
         upload_success = False
-        upload_failures.append("⚠️ FA log missing, empty, or stale")
+        upload_failures.append(" FA log missing, empty, or stale")
 
 else:
-    log(f"❌ Server {server_address} is unreachable. Upload step skipped.")
-    upload_failures.append(f"❌ Server unreachable: {server_address}")
+    log(f" Server {server_address} is unreachable. Upload step skipped.")
+    upload_failures.append(f" Server unreachable: {server_address}")
 
 # === WRITE LOG ===
 # Generate the main summary HTML report with consistent styling, summary statistics, and change tables
@@ -716,7 +718,7 @@ with open(report_file, "w", encoding="utf-8") as f:
     # Only show server status if it is DOWN
     if not server_online:
         f.write(
-            f"<p style='color:darkred;'><b>Server Status:</b> ❌ "
+            f"<p style='color:darkred;'><b>Server Status:</b>  "
             f"{SERVER_HOST}:{SERVER_PORT} is UNREACHABLE — upload skipped</p>\n"
         )
 
@@ -871,7 +873,7 @@ with open(report_file, "w", encoding="utf-8") as f:
         os.remove(yesterday_xml)
 
      # Add explicit AssetWorks upload result at the bottom
-    upload_line = "AssetWorks upload: DONE" if upload_success else "❌ AssetWorks upload: NOT CONFIRMED"
+    upload_line = "AssetWorks upload: DONE" if upload_success else " AssetWorks upload: NOT CONFIRMED"
     if upload_failures:
         upload_line += " — " + " | ".join(upload_failures)
     f.write(f"<p style='margin-top:30px; margin-bottom:0;'><b>{upload_line}</b></p>")
@@ -927,7 +929,7 @@ with open(report_file, "w", encoding="utf-8") as f:
         else:
             f.write("<p><i>No FA DataLoader log was found for today.</i></p>")
     except Exception as e:
-        f.write(f"<p style='color:darkred;'><b>⚠️ Failed to include FA DataLoader log:</b> {escape(str(e))}</p>")
+        f.write(f"<p style='color:darkred;'><b> Failed to include FA DataLoader log:</b> {escape(str(e))}</p>")
 
     # Mark report end time
     f.write(f"<p><b>End:</b> {datetime.now()}</p>")
@@ -944,7 +946,7 @@ try:
 
     send_email_html(EMAIL_RECIPIENTS, subject, html_body)
 except Exception as e:
-    log(f"❌ Failed to prepare/send email: {e}")
+    log(f" Failed to prepare/send email: {e}")
 
 # === GENERATE INDIVIDUAL OPERATOR EMAILS ===
 # Creates a separate HTML file for each operator affected by any change.
@@ -1046,7 +1048,7 @@ for category, driver_ids in changes.items():
                         subject_line = f"[Driver Alert] {emp['OperatorName']} – {category.replace('_', ' ').upper()}"
                         send_email_html(EMAIL_RECIPIENTS, subject_line, html_content)
                 except Exception as e:
-                    log(f"❌ Failed to send individual email for {emp['OperatorName']}: {e}")
+                    log(f" Failed to send individual email for {emp['OperatorName']}: {e}")
 
 # === WRITE RUN SUMMARY TO DAILY LOG FILE ===
 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1069,7 +1071,7 @@ if os.path.exists(fa_logs_root):
 # Prepare log content
 log_summary = [
     "\n\n" + "=" * 25 + f" RUN: {timestamp} " + "=" * 25,
-    f"✅ Total operators parsed: {total_today}",
+    f" Total operators parsed: {total_today}",
     f"❗ Total unlicensed operators: {total_unlicenced}",
     "\n➤ Comparison Summary:",
     f"  - Class changes: {len(changes['class'])}",
@@ -1093,9 +1095,9 @@ if latest_fa_log and os.path.exists(latest_fa_log):
         with open(latest_fa_log, "r", encoding="utf-8", errors="ignore") as lf:
             log_summary.append(lf.read())
     except Exception as e:
-        log_summary.append(f"⚠️ Failed to read FADataLoader log: {e}")
+        log_summary.append(f" Failed to read FADataLoader log: {e}")
 else:
-    log_summary.append("⚠️ No FADataLoader .txt log file found.")
+    log_summary.append(" No FADataLoader .txt log file found.")
 
 log_summary.append("=" * 60)
 
@@ -1103,17 +1105,29 @@ log_summary.append("=" * 60)
 with open(log_file, "a", encoding="utf-8") as f:
     f.write("\n".join(log_summary) + "\n")
 
-print(f"✅ Log updated: {log_file}")
+print(f" Log updated: {log_file}")
 
-# Empty input folder for next drop
+# Backup today's input file, then empty input folder for next drop
+try:
+    if os.path.exists(input_file):
+        # Copy as input_YYYY-MM-DD.txt into input_backups/
+        backup_name = f"input_{today}.txt"
+        backup_path = os.path.join(FOLDERS["input_backups"], backup_name)
+        shutil.copy2(input_file, backup_path)
+        log(f" Backed up input file to: {backup_path}")
+    else:
+        log(f" Skipped input backup (not found): {input_file}")
+except Exception as e:
+    log(f" Failed to back up input file: {e}")
+
 try:
     wipe_folder(FOLDERS["input"])
     log("Emptied input folder.")
 except Exception as e:
-    log(f"⚠️ Failed to empty input folder: {e}")
+    log(f" Failed to empty input folder: {e}")
 
 # Remove output Excel-XML files older than 48h
 try:
     cleanup_output_folder(max_age_hours=48)
 except Exception as e:
-    log(f"⚠️ Output cleanup error: {e}")
+    log(f" Output cleanup error: {e}")
