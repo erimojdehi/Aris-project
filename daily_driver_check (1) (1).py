@@ -5,6 +5,7 @@ import time
 import smtplib
 import shutil
 import socket
+import traceback
 import subprocess
 import configparser
 import pandas as pd
@@ -86,28 +87,87 @@ def is_server_online(host, port, timeout=3):
 # Establish filenames and paths for today’s input, output, logs, and report files
 today = datetime.today().date()
 yesterday = today - timedelta(days=1)
+
+# Unique run timestamp (e.g., 2025-08-20_07-03-12) so multiple tests in a day don't collide
+RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
 input_file = os.path.join(FOLDERS["input"], f"input_{today}.txt")
 today_xml = os.path.join(FOLDERS["output"], f"ARIS_{today}.xml")
 yesterday_xml = os.path.join(FOLDERS["output"], f"ARIS_{yesterday}.xml")
-report_file = os.path.join(FOLDERS["reports"], f"comparison_{today}.html")
-log_file = os.path.join(FOLDERS["logs"], f"driver_log_{today}.txt")
+
+# Per-run report/log file names include time
+report_file = os.path.join(FOLDERS["reports"], f"comparison_{RUN_TS}.html")
+log_file = os.path.join(FOLDERS["logs"], f"driver_log_{RUN_TS}.txt")
+
 employee_csv = os.path.join(FOLDERS["assets"], "Active Operator List.csv")
 
-# Keep only the 3 most recent log files
-log_files = sorted(
-    [f for f in os.listdir(FOLDERS["logs"]) if f.startswith("driver_log_") and f.endswith(".txt")],
-    reverse=True
-)
-for old_log in log_files[:-3]:  # keep only 3 most recent
-    try:
-        os.remove(os.path.join(FOLDERS["logs"], old_log))
-    except Exception as e:
-        print(f" Failed to delete old log: {old_log} – {e}")
+# Keep logs for ~30 days (by modified time)
+try:
+    cutoff = datetime.now() - timedelta(days=30)
+    for name in os.listdir(FOLDERS["logs"]):
+        if not (name.startswith("driver_log_") and name.endswith(".txt")):
+            continue
+        path = os.path.join(FOLDERS["logs"], name)
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(path))
+            if mtime < cutoff:
+                os.remove(path)
+        except Exception as e:
+            print(f" Failed to evaluate/delete old log: {name} – {e}")
+except Exception as e:
+    print(f" Log retention scan failed: {e}")
 
 # Custom logging function to timestamp messages and store them in memory
 def log(msg):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] {msg}")
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{ts}] {msg}"
+    # console
+    print(line)
+    # file (crash-safe)
+    try:
+        os.makedirs(FOLDERS["logs"], exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as lf:
+            lf.write(line + "\n")
+    except Exception as e:
+        # last resort: keep console output only
+        print(f"[{ts}] [logfile-error] {e}")
+
+def notify_failure(reason, details=None, subject_suffix="FAILED"):
+    """Send a minimal failure email immediately. Safe to call at any point."""
+    try:
+        html = [
+            f"<h2>Driver Licence Change Report – {RUN_TS}</h2>",
+            f"<p><b>Status:</b> {subject_suffix}</p>",
+            f"<p><b>Reason:</b> {escape(str(reason))}</p>",
+            f"<p><b>Time:</b> {datetime.now()}</p>",
+        ]
+        if details:
+            html.append("<pre style='white-space:pre-wrap;'>" + escape(str(details)) + "</pre>")
+        send_email_html(EMAIL_RECIPIENTS, f"Driver Licence Change Report – {RUN_TS} [{subject_suffix}]", "\n".join(html))
+        log(f"Failure email sent: {subject_suffix}")
+    except Exception as e:
+        log(f"Failed to send failure email: {e}")
+
+# === GLOBAL CRASH CATCHER (no reindent needed) ===
+def _global_excepthook(exctype, value, tb):
+    # Ignore intentional SystemExit (e.g., NO INPUT)
+    if exctype is SystemExit:
+        try:
+            code = value.code if hasattr(value, "code") else value
+            log(f"Run stopped with exit code {code}")
+        except Exception:
+            pass
+        return
+
+    trace = "".join(traceback.format_exception(exctype, value, tb))
+    log(f"FATAL (uncaught): {value}")
+    log(trace)
+    try:
+        notify_failure("Unhandled exception during run", trace, subject_suffix="CRASH")
+    except Exception as e:
+        log(f"Failed to send crash email: {e}")
+
+sys.excepthook = _global_excepthook
 
 # === EMAIL FUNCTION ===
 def send_email_html(to_addresses, subject, html_content):
@@ -126,23 +186,29 @@ def send_email_html(to_addresses, subject, html_content):
         with smtplib.SMTP("smtp.northbay.ca", 25) as server:
             server.starttls()
             server.send_message(msg)
-            log(f"📧 Email sent to: {', '.join(to_addresses)}")
+            log(f" Email sent to: {', '.join(to_addresses)}")
     except Exception as e:
         log(f" Failed to send email to {', '.join(to_addresses)}: {e}")
 
 # Access check
 def check_directory_write_access(folder_paths):
+    had_error = False
     for folder in folder_paths:
         test_file = os.path.join(folder, ".__test_write.tmp")
         try:
+            os.makedirs(folder, exist_ok=True)
             with open(test_file, "w") as f:
                 f.write("test")
             os.remove(test_file)
         except Exception as e:
-            log(f" ERROR: Cannot write to folder: {folder}")
-            log(f"   Reason: {e}")
-            print(f" Program aborted due to folder access error.")
-            sys.exit(1)
+            had_error = True
+            log(f"ERROR: Cannot write to folder: {folder}")
+            log(f"  Reason: {e}")
+    if had_error:
+        # Do not continue; notify and stop cleanly.
+        notify_failure("One or more folders are not writable.", "Fix permissions and rerun.", subject_suffix="ENV ERROR")
+        raise SystemExit(2)
+
 
 # Load the employee master CSV and validate its format
 def load_employee_csv():
@@ -490,11 +556,24 @@ def compare_dfs(df1, df2):
 start_time = datetime.now()
 log(f"=== DAILY DRIVER CHECK START ===")
 log(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+run_failed = False
 
-# Check for today's input file and exit if not found
-if not os.path.exists(input_file):
-    log(f" Input file not found: {input_file}")
-    sys.exit(1)
+try:
+    # === Check for today's input file and exit if not found ===
+    if not os.path.exists(input_file):
+        log(f"Input file not found: {input_file}")
+        notify_failure("No input file found", f"Looked for: {input_file}", subject_suffix="NO INPUT")
+        raise SystemExit(2)  # clean stop; still goes to finally
+
+    # ===== From here down to the end of the "SEND MAIN SUMMARY EMAIL" block,
+    # ===== indent your existing code so it's INSIDE this try: block. =====
+
+except Exception as e:
+    run_failed = True
+    tb = traceback.format_exc()
+    log(f"FATAL: {e}")
+    log(tb)
+    notify_failure("Unhandled exception during run", tb)
 
 # Parse ARIS .txt input into XML and DataFrame
 df_today = parse_aris_txt_to_xml(input_file, today_xml)
@@ -535,7 +614,7 @@ for name in os.listdir(FOLDERS["data_loader"]):
         path = os.path.join(FOLDERS["data_loader"], name)
         try:
             os.remove(path)
-            log(f"🗑️ Deleted old DataLoader file: {path}")
+            log(f" Deleted old DataLoader file: {path}")
         except Exception as e:
             log(f" Could not delete {path}: {e}")
 
@@ -564,15 +643,13 @@ if server_online:
     try:
         data_loader_dir = FOLDERS["data_loader"]  
         bat_content = f"""@echo off
-    setlocal
-    pushd "{data_loader_dir}"
-    REM Now we're in a temp drive letter that maps the UNC; relative paths work.
-
-    START "" /WAIT FADATALOADER.EXE -n "10" -l "logs" -a "{server_address}" -u "{FA_USER}" -p "{FA_PASS}" -i "{xml_filename}"
-
-    popd
-    endlocal
-    """
+setlocal
+pushd "{data_loader_dir}"
+REM In DataLoader dir; run synchronously
+FADATALOADER.EXE -n "10" -l "logs" -a "{server_address}" -u "{FA_USER}" -p "{FA_PASS}" -i "{xml_filename}"
+popd
+endlocal
+"""
         with open(bat_file_path, "w", encoding="utf-8", newline="\r\n") as f:
             f.write(bat_content)
 
@@ -586,8 +663,9 @@ if server_online:
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         result = subprocess.run(
             ["cmd.exe", "/c", bat_file_path],
-            creationflags=flags,
-            timeout=300
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            timeout=300,
+            cwd=FOLDERS["data_loader"]
         )
         fa_exit_code = result.returncode
         log(f" runfile.bat executed (FA exit code: {fa_exit_code})")
@@ -659,7 +737,7 @@ with open(report_file, "w", encoding="utf-8") as f:
 
     # Report header and styling
     title_prefix = "**DRIVER SUSPENDED** " if contains_suspended else ""
-    f.write(f"<h2>{title_prefix}Driver Licence Change Report – {today}</h2>\n")
+    f.write(f"<h2>{title_prefix}Driver Licence Change Report – {RUN_TS}</h2>\n")
     f.write("""
     <style>
         body {
@@ -940,7 +1018,7 @@ try:
         html_body = rf.read()
 
     # subject line — add server-down flag when offline
-    subject = f"Driver Licence Change Report – {today}"
+    subject = f"Driver Licence Change Report – {RUN_TS}"
     if not server_online:
         subject += " [SERVER DOWN]"
 
@@ -976,7 +1054,7 @@ for category, driver_ids in changes.items():
                 
                 # Build safe filename using operator name and change type
                 operator_name_safe = re.sub(r'[\\/*?:"<>|]', "_", emp['OperatorName']).replace(",", "").replace(" ", "_")
-                filename = os.path.join(FOLDERS["emails"], f"{operator_name_safe}_{category}.html")
+                filename = os.path.join(FOLDERS["emails"], f"{operator_name_safe}_{category}_{RUN_TS}.html")
 
                 with open(filename, "w", encoding="utf-8") as indf:
                     # Construct appropriate description for expiry-related alerts
@@ -1073,14 +1151,14 @@ log_summary = [
     "\n\n" + "=" * 25 + f" RUN: {timestamp} " + "=" * 25,
     f" Total operators parsed: {total_today}",
     f"❗ Total unlicensed operators: {total_unlicenced}",
-    "\n➤ Comparison Summary:",
+    "\n Comparison Summary:",
     f"  - Class changes: {len(changes['class'])}",
     f"  - Status changes: {len(changes['status'])}",
     f"  - Endorsement/restriction changes: {len(changes['comments'])}",
     f"  - Expiring licences (within {EXPIRY_WINDOW_DAYS} days): {len(changes['expiring_licences'])}",
     f"  - Expiring medicals (within {EXPIRY_WINDOW_DAYS} days): {len(changes['expiring_medicals'])}",
     f"  - Errors: {len(changes['errors'])}",
-    "\n➤ Upload Summary (FADataLoader):",
+    "\n Upload Summary (FADataLoader):",
     f"  - Upload successful: {'Yes' if upload_success else 'No'}"
 ]
 
@@ -1089,7 +1167,7 @@ if upload_failures:
     log_summary.extend(["    • " + failure for failure in upload_failures])
 
 # Append actual FADataLoader log content
-log_summary.append("\n➤ FADataLoader Log Output:")
+log_summary.append("\n FADataLoader Log Output:")
 if latest_fa_log and os.path.exists(latest_fa_log):
     try:
         with open(latest_fa_log, "r", encoding="utf-8", errors="ignore") as lf:
@@ -1108,23 +1186,42 @@ with open(log_file, "a", encoding="utf-8") as f:
 print(f" Log updated: {log_file}")
 
 # Backup today's input file, then empty input folder for next drop
+backup_ok = False
 try:
     if os.path.exists(input_file):
-        # Copy as input_YYYY-MM-DD.txt into input_backups/
         backup_name = f"input_{today}.txt"
         backup_path = os.path.join(FOLDERS["input_backups"], backup_name)
+        os.makedirs(FOLDERS["input_backups"], exist_ok=True)
         shutil.copy2(input_file, backup_path)
-        log(f" Backed up input file to: {backup_path}")
-    else:
-        log(f" Skipped input backup (not found): {input_file}")
-except Exception as e:
-    log(f" Failed to back up input file: {e}")
 
-try:
-    wipe_folder(FOLDERS["input"])
-    log("Emptied input folder.")
+        # Verify backup (size match)
+        src_size = os.path.getsize(input_file)
+        dst_size = os.path.getsize(backup_path)
+        backup_ok = (src_size == dst_size)
+
+        if backup_ok:
+            log(f"Backed up input file to: {backup_path} (verified)")
+        else:
+            log(f"Backup verification failed: {backup_path} (size mismatch)")
+    else:
+        log(f"Skipped input backup (not found): {input_file}")
 except Exception as e:
-    log(f" Failed to empty input folder: {e}")
+    log(f"Failed to back up input file: {e}")
+    backup_ok = False
+
+# Only wipe if earlier steps ran AND backup is verified
+try:
+    if not run_failed and backup_ok:
+        wipe_folder(FOLDERS["input"])
+        log("Emptied input folder.")
+    elif not run_failed and not backup_ok and os.path.exists(input_file):
+        # We had an input, backup failed, and run didn't otherwise fail: notify and DO NOT WIPE
+        notify_failure("Backup failed; input not wiped", f"Input: {input_file}", subject_suffix="BACKUP ERROR")
+        log("Backup failed; input folder NOT emptied.")
+    else:
+        log("Skipping wipe (run failed or no input to protect).")
+except Exception as e:
+    log(f"Failed to empty input folder: {e}")
 
 # Remove output Excel-XML files older than 48h
 try:
